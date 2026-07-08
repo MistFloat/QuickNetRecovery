@@ -1,0 +1,15 @@
+{
+    "run_mode": "interactive",
+    "check_targets": ["baidu.com", "sina.com", "bilibili.com"],
+    "repair_order": [
+        "repair_remove_meta_tunnel",
+        "repair_enable_adapter",
+        "repair_renew_dhcp",
+        "repair_reset_winsock",
+        "repair_clear_proxy",
+        "repair_reset_dns",
+        "repair_restart_services",
+        "repair_fix_hosts"
+    ],
+    "log_enabled": true
+}

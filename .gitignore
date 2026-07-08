@@ -1,0 +1,32 @@
+# 日志目录
+logs/
+
+# 日志文件
+*.log
+
+# hosts 备份文件
+hosts.backup.*
+*.backup.*
+
+# Windows 系统文件
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# PowerShell 临时文件
+*.ps1.tmp
+*.psm1.tmp
+
+# VS Code
+.vscode/
+
+# IDE / Editor
+.idea/
+*.swp
+*.swo
+*~
+
+# 压缩包
+*.zip
+*.7z
+*.rar
