@@ -1,63 +1,41 @@
 function Invoke-RepairRemoveMetaTunnel {
-    <#
-    .SYNOPSIS
-        移除 Meta Tunnel 虚拟网络适配器
-    .DESCRIPTION
-        扫描并禁用/卸载 Meta Tunnel、TUN、TAP 等可能干扰正常网络的虚拟网卡
-    #>
     param([switch]$Quiet)
-
-    $matched = $false
-    $vNics = Get-NetAdapter -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match "Meta.*Tunnel|TUN|TAP|虚拟网卡" }
-
-    if (-not $vNics) {
-        if (-not $Quiet) { Write-Host "  [修复] 未检测到虚拟隧道网卡" -ForegroundColor Green }
-        return @{ success = $true; message = "无需要处理的虚拟适配器"; changes = @() }
+    $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match "(?i)Meta.*Tunnel" -or $_.InterfaceDescription -match "(?i)Meta.*Tunnel"
     }
-
-    $applied = @()
-    foreach ($vnic in $vNics) {
-        if (-not $Quiet) { Write-Host "  [修复] 正在处理虚拟适配器: $($vnic.Name)" -ForegroundColor Yellow }
-
-        # 步骤 1: 先禁用该适配器
+    if (-not $adapters) { if (-not $Quiet) { Write-Host "  [Repair] No Meta Tunnel adapters found" -ForegroundColor Green }; return @{success=$true;message="Nothing to remove";changes=@()} }
+    $changes = @()
+    $errors = @()
+    foreach ($a in $adapters) {
+        if (-not $Quiet) { Write-Host "  [Repair] Processing: $($a.Name)" -ForegroundColor Yellow }
         try {
-            Disable-NetAdapter -Name $vnic.Name -Confirm:$false -ErrorAction SilentlyContinue
-            $applied += "已停用适配器: $($vnic.Name)"
-            if (-not $Quiet) { Write-Host "    → 适配器已停用" -ForegroundColor Gray }
-        } catch {
-            if (-not $Quiet) { Write-Host "    → 停用失败: $_" -ForegroundColor Red }
+            Disable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop
+            $changes += "Disabled: $($a.Name)"
         }
+        catch { $errors += "Disable $($a.Name): $($_.Exception.Message)" }
 
-        # 步骤 2: 通过 PnP 接口卸载设备
         try {
-            $device = Get-PnpDevice -ErrorAction SilentlyContinue |
-                Where-Object { $_.FriendlyName -eq $vnic.Name -or $_.Name -eq $vnic.Name }
-            if ($device) {
-                Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
-                $device | Remove-PnpDevice -Confirm:$false -ErrorAction SilentlyContinue
-                $applied += "PnP 设备已移除: $($device.FriendlyName)"
-                if (-not $Quiet) { Write-Host "    → PnP 设备已移除" -ForegroundColor Green }
-            } else {
-                # 备选方案：WMI 卸载
-                $wmiObj = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -eq $vnic.Name }
-                if ($wmiObj) {
-                    Invoke-CimMethod -InputObject $wmiObj -MethodName "Uninstall" -ErrorAction SilentlyContinue | Out-Null
-                    $applied += "已通过 WMI 卸载: $($vnic.Name)"
-                    if (-not $Quiet) { Write-Host "    → WMI 卸载成功" -ForegroundColor Green }
+            $pnp = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
+                $_.FriendlyName -eq $a.Name -or $_.FriendlyName -eq $a.InterfaceDescription
+            }
+            if ($pnp -and (Get-Command Remove-PnpDevice -ErrorAction SilentlyContinue)) {
+                $pnp | Remove-PnpDevice -Confirm:$false -ErrorAction Stop
+                $changes += "Removed PnP: $($a.Name)"
+            }
+            else {
+                $wmi = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $a.Name }
+                if ($wmi) {
+                    Invoke-CimMethod -InputObject $wmi -MethodName Uninstall -ErrorAction Stop | Out-Null
+                    $changes += "Removed WMI: $($a.Name)"
                 }
             }
-        } catch {
-            if (-not $Quiet) { Write-Host "    → 设备卸载异常: $_" -ForegroundColor DarkYellow }
         }
-
-        $matched = $true
+        catch {
+            $errors += "Remove $($a.Name): $($_.Exception.Message)"
+            if (-not $Quiet) { Write-Host "    PnP removal failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+        }
     }
-
-    return @{
-        success = $true
-        message = if ($matched) { "虚拟网卡处理完毕" } else { "未发现虚拟网卡" }
-        changes = $applied
-    }
+    $message = "Processed $($adapters.Count) Meta Tunnel adapter(s)"
+    if ($errors.Count -gt 0) { $message += "; errors $($errors.Count)" }
+    return @{success=$errors.Count-eq0;message=$message;changes=$changes;errors=$errors}
 }

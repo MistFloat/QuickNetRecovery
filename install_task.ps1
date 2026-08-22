@@ -1,110 +1,122 @@
 <#
 .SYNOPSIS
-    安装 / 移除 QuickNet 定时任务 —— 断网时自动触发诊断与修复
+    Installs or removes the event-driven NetQuickFix scheduled task.
 .DESCRIPTION
-    向 Windows 计划任务库注册一个事件驱动的定时任务：
-    - 标识: NetworkDisconnectRunScript
-    - 权限: 提权运行
-    - 触发条件: Microsoft-Windows-NetworkProfile/Operational 通道中
-                NetworkProfile 源发出事件 ID 10001（网络断开连接）
-    - 执行动作: 以 auto 模式无窗口运行 QuickNet
+    The task starts NetQuickFix in automatic mode 30 seconds after Windows logs
+    NetworkProfile event 10001 (network disconnected).
 #>
 
+[CmdletBinding()]
 param(
-    [switch]$Remove  # 删除已安装的任务
+    [switch]$Remove,
+    [switch]$ValidateOnly
 )
 
-$JobName   = "NetworkDisconnectRunScript"
-$OwnFolder = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ScriptRef = Join-Path $OwnFolder "netfix.ps1"
+$ErrorActionPreference = "Stop"
+$taskName = "NetworkDisconnectRunScript"
+$projectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$mainScript = Join-Path $projectDir "netfix.ps1"
+$powerShellPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
 
-# ============================================================
-# 移除任务
-# ============================================================
+function Test-IsAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+if (-not $ValidateOnly -and -not (Test-IsAdministrator)) {
+    Write-Host "Requesting administrator permission..." -ForegroundColor Yellow
+    $arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`""
+    if ($Remove) { $arguments += " -Remove" }
+
+    try {
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $powerShellPath
+        $processInfo.Arguments = $arguments
+        $processInfo.Verb = "RunAs"
+        [System.Diagnostics.Process]::Start($processInfo) | Out-Null
+        exit 0
+    }
+    catch {
+        throw "Administrator permission was not granted. $($_.Exception.Message)"
+    }
+}
+
+$scheduler = New-Object -ComObject "Schedule.Service"
+$scheduler.Connect()
+$rootFolder = $scheduler.GetFolder("\")
+
 if ($Remove) {
-    $existingCheck = schtasks /query /tn $JobName 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        schtasks /delete /tn $JobName /f
-        Write-Host "[完成] 定时任务已移除: $JobName" -ForegroundColor Green
-    } else {
-        Write-Host "[信息] 定时任务未注册: $JobName" -ForegroundColor Yellow
+    try {
+        $rootFolder.GetTask($taskName) | Out-Null
+        $rootFolder.DeleteTask($taskName, 0)
+        Write-Host "Scheduled task removed: $taskName" -ForegroundColor Green
+    }
+    catch {
+        if ($_.Exception.HResult -eq -2147024894) {
+            Write-Host "Scheduled task is not installed: $taskName" -ForegroundColor Yellow
+        }
+        else {
+            throw
+        }
     }
     exit 0
 }
 
-# ============================================================
-# 安装任务
-# ============================================================
-Write-Host "QuickNet 事件驱动任务安装程序" -ForegroundColor Cyan
-Write-Host ""
-
-# 管理员身份校验
-$whoAmI   = [Security.Principal.WindowsIdentity]::GetCurrent()
-$role     = New-Object Security.Principal.WindowsPrincipal($whoAmI)
-if (-not $role.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "[错误] 需要管理员身份才能注册计划任务" -ForegroundColor Red
-    Write-Host "按任意键退出..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-    exit 1
+if (-not (Test-Path -LiteralPath $mainScript)) {
+    throw "Main script not found: $mainScript"
+}
+if (-not (Test-Path -LiteralPath $powerShellPath)) {
+    throw "Windows PowerShell not found: $powerShellPath"
 }
 
-# 主脚本文件存在性检查
-if (-not (Test-Path $ScriptRef)) {
-    Write-Host "[错误] 找不到核心脚本: $ScriptRef" -ForegroundColor Red
-    exit 1
+$taskDefinition = $scheduler.NewTask(0)
+$taskDefinition.RegistrationInfo.Description = "Run NetQuickFix after a network disconnect event"
+$taskDefinition.RegistrationInfo.Author = "NetQuickFix"
+
+$taskDefinition.Principal.UserId = "SYSTEM"
+$taskDefinition.Principal.LogonType = 5       # TASK_LOGON_SERVICE_ACCOUNT
+$taskDefinition.Principal.RunLevel = 1       # TASK_RUNLEVEL_HIGHEST
+
+$taskDefinition.Settings.Enabled = $true
+$taskDefinition.Settings.StartWhenAvailable = $true
+$taskDefinition.Settings.DisallowStartIfOnBatteries = $false
+$taskDefinition.Settings.StopIfGoingOnBatteries = $false
+$taskDefinition.Settings.ExecutionTimeLimit = "PT5M"
+$taskDefinition.Settings.MultipleInstances = 2 # TASK_INSTANCES_IGNORE_NEW
+
+$logName = "Microsoft-Windows-NetworkProfile/Operational"
+$providerName = "Microsoft-Windows-NetworkProfile"
+$subscription = "<QueryList><Query Id='0' Path='$logName'><Select Path='$logName'>*[System[Provider[@Name='$providerName'] and EventID=10001]]</Select></Query></QueryList>"
+$trigger = $taskDefinition.Triggers.Create(0) # TASK_TRIGGER_EVENT
+$trigger.Id = "NetworkDisconnected"
+$trigger.Enabled = $true
+$trigger.Subscription = $subscription
+$trigger.Delay = "PT30S"
+
+$action = $taskDefinition.Actions.Create(0) # TASK_ACTION_EXEC
+$action.Path = $powerShellPath
+$action.Arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$mainScript`" -RunAs auto -NoPause"
+$action.WorkingDirectory = $projectDir
+
+if ($ValidateOnly) {
+    [xml]$taskDefinition.XmlText | Out-Null
+    Write-Host "Scheduled task definition: OK" -ForegroundColor Green
+    exit 0
 }
 
-# 先清理已有任务
-$existingCheck = schtasks /query /tn $JobName 2>&1
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "[信息] 已有同名任务，将替换为新版本..." -ForegroundColor Yellow
-    schtasks /delete /tn $JobName /f
+# TASK_CREATE_OR_UPDATE = 6; TASK_LOGON_SERVICE_ACCOUNT = 5
+$rootFolder.RegisterTaskDefinition($taskName, $taskDefinition, 6, "SYSTEM", $null, 5, $null) | Out-Null
+
+$registeredTask = $rootFolder.GetTask($taskName)
+if (-not $registeredTask.Enabled) {
+    throw "The scheduled task was registered but is disabled."
 }
 
-# 拼接执行命令
-$execLine = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptRef`" -RunAs auto"
-
-# 事件过滤器
-# /sc ONEVENT     = 事件为触发器
-# /ec             = 事件通道
-# /mo             = XPath 过滤 (Provider=NetworkProfile, EventID=10001)
-# /ru SYSTEM      = 执行身份为 SYSTEM
-# /rl HIGHEST     = 以最高特权级运行
-# /f              = 有同名任务时直接覆盖
-# /delay 0000:30  = 事件触发后等待 30 秒才开始执行
-$eventQuery = "*[System[Provider[@Name='NetworkProfile'] and EventID=10001]]"
-
-$creationResult = schtasks /create `
-    /tn $JobName `
-    /tr $execLine `
-    /sc ONEVENT `
-    /ec "Microsoft-Windows-NetworkProfile/Operational" `
-    /mo $eventQuery `
-    /ru SYSTEM `
-    /rl HIGHEST `
-    /f `
-    /delay 0000:30 2>&1
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host ""
-    Write-Host "[完成] 事件驱动任务已成功创建!" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "任务摘要:" -ForegroundColor Cyan
-    Write-Host "  名称: $JobName" -ForegroundColor White
-    Write-Host "  触发通道: Microsoft-Windows-NetworkProfile/Operational" -ForegroundColor White
-    Write-Host "  触发事件: 10001（网络断开）" -ForegroundColor White
-    Write-Host "  冷却延迟: 30 秒" -ForegroundColor White
-    Write-Host "  实际执行: netfix.ps1 -RunAs auto" -ForegroundColor White
-    Write-Host "  执行账户: SYSTEM / 最高权限" -ForegroundColor White
-    Write-Host ""
-    Write-Host "网络断开时将自动触发诊断修复流程" -ForegroundColor Green
-    Write-Host "要移除请运行: .\install_task.ps1 -Remove" -ForegroundColor Gray
-} else {
-    Write-Host "[错误] 任务注册失败:" -ForegroundColor Red
-    Write-Host $creationResult -ForegroundColor Red
-    exit 1
-}
-
-Write-Host ""
-Write-Host "按任意键退出..." -ForegroundColor Gray
-$null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+Write-Host "Scheduled task installed successfully." -ForegroundColor Green
+Write-Host "  Name:       $taskName"
+Write-Host "  Event:      $providerName / 10001"
+Write-Host "  Delay:      30 seconds"
+Write-Host "  Account:    SYSTEM (highest privileges)"
+Write-Host "  Action:     netfix.ps1 -RunAs auto -NoPause"
+Write-Host "  Remove:     .\install_task.ps1 -Remove" -ForegroundColor Gray

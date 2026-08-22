@@ -1,43 +1,23 @@
 function Invoke-RepairRenewDhcp {
-    <#
-    .SYNOPSIS
-        强制重新获取 IP 地址租约
-    #>
     param([switch]$Quiet)
-
-    if (-not $Quiet) { Write-Host "  [修复] 重新申请 DHCP 地址..." -ForegroundColor Yellow }
-
-    $applied = @()
-
-    # 释放当前租约
-    try {
-        if (-not $Quiet) { Write-Host "    → 正在释放旧 IP..." -ForegroundColor Gray }
-        $stepRelease = ipconfig /release 2>&1 | Out-String
-        $applied += "已断开当前 DHCP 租约"
-        Start-Sleep -Milliseconds 500
-    } catch {
-        if (-not $Quiet) { Write-Host "    → 释放失败: $_" -ForegroundColor Red }
+    if (-not $Quiet) { Write-Host "  [Repair] Renewing DHCP..." -ForegroundColor Yellow }
+    $changes = @()
+    $errors = @()
+    $activeIndexes = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+        Where-Object { $_.HardwareInterface -eq $true -and $_.Status -eq "Up" } |
+        ForEach-Object { $_.ifIndex })
+    $dhcpInterfaces = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $activeIndexes -contains $_.InterfaceIndex -and $_.Dhcp -eq "Enabled" })
+    if ($dhcpInterfaces.Count -eq 0) {
+        return @{success=$false;message="No active DHCP-enabled physical adapter";changes=@();errors=@()}
     }
 
-    # 重新获取
-    try {
-        if (-not $Quiet) { Write-Host "    → 正在获取新 IP..." -ForegroundColor Gray }
-        $stepRenew = ipconfig /renew 2>&1 | Out-String
-        $applied += "已重新获取 DHCP 配置"
-    } catch {
-        if (-not $Quiet) { Write-Host "    → 续租失败: $_" -ForegroundColor Red }
-    }
+    & ipconfig.exe /release 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { $changes += "DHCP released" } else { $errors += "ipconfig /release failed with exit code $LASTEXITCODE" }
+    Start-Sleep -Milliseconds 500
+    & ipconfig.exe /renew 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { $changes += "DHCP renewed" } else { $errors += "ipconfig /renew failed with exit code $LASTEXITCODE" }
 
-    # 把静态 IP 接口也切回 DHCP
-    try {
-        $manualIps = Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.Dhcp -eq "Disabled" -and $_.InterfaceAlias -notmatch "Loopback|Bluetooth" }
-        foreach ($iface in $manualIps) {
-            netsh interface ip set address "$($iface.InterfaceAlias)" dhcp 2>&1 | Out-Null
-            $applied += "接口恢复 DHCP: $($iface.InterfaceAlias)"
-            if (-not $Quiet) { Write-Host "    → 恢复 DHCP: $($iface.InterfaceAlias)" -ForegroundColor Green }
-        }
-    } catch { }
-
-    return @{ success = $true; message = "IP 地址刷新完毕"; changes = $applied }
+    $message = if ($errors.Count -eq 0) { "DHCP lease renewed" } else { "DHCP renewal completed with errors" }
+    return @{success=$errors.Count-eq0;message=$message;changes=$changes;errors=$errors}
 }

@@ -1,82 +1,40 @@
-function Audit-IPConfiguration {
-    <#
-    .SYNOPSIS
-        第 2 层 —— IP 栈配置审计
-    .DESCRIPTION
-        验证默认网关存在性及可达性、DHCP 工作状态、是否存在 APIPA 兜底地址
-    #>
-    $problems = @()
-    $snap    = @{}
-
-    Write-Host "  [IP配置审计] 检查路由表、DHCP 状态、地址类型..." -ForegroundColor Cyan
-
-    # 1. 默认路由 / 网关
-    $defaultRoutes = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue
-    $snap.GatewayCount = $defaultRoutes.Count
-    $gateIpList = $defaultRoutes | ForEach-Object { $_.NextHop }
-    $snap.GatewayIPs = $gateIpList
-
-    if (-not $defaultRoutes -or $defaultRoutes.Count -eq 0) {
-        $problems += @{
-            Code       = "nnc_no_gateway"
-            Severity   = "error"
-            Message    = "路由表中不存在默认网关条目"
-            Treatments = @("repair_renew_dhcp", "repair_enable_adapter")
-        }
+function Invoke-DiagNetwork {
+    Write-Host "  [Network] Checking gateway, DHCP, subnet..." -ForegroundColor Cyan
+    $issues = @()
+    $d = @{}
+    $activeIndexes = @(Get-NetAdapter -ErrorAction SilentlyContinue |
+        Where-Object { $_.HardwareInterface -eq $true -and $_.Status -eq "Up" } |
+        ForEach-Object { $_.ifIndex })
+    $ifaces = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $activeIndexes -contains $_.InterfaceIndex })
+    $gws = @(Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Where-Object { $activeIndexes -contains $_.InterfaceIndex })
+    $d.GatewayCount = $gws.Count
+    if (-not $gws -or $gws.Count -eq 0) {
+        $gatewayRepairs = if (@($ifaces | Where-Object { $_.Dhcp -eq "Enabled" }).Count -gt 0) { @("repair_renew_dhcp") } else { @() }
+        $issues += @{ Code = "nnc_no_gateway"; Severity = "error"; Message = "No default gateway found on an active physical adapter"; Repairs = $gatewayRepairs }
     } else {
-        Write-Host "    默认路由指向: $($gateIpList -join ', ')" -ForegroundColor Gray
-        foreach ($gw in $gateIpList) {
-            try {
-                $alive = Test-Connection -ComputerName $gw -Count 1 -Quiet -ErrorAction SilentlyContinue
-                if (-not $alive) {
-                    Write-Host "    [WARN] 无法 ping 通网关 $gw" -ForegroundColor Yellow
-                }
-            } catch { }
-        }
+        Write-Host "    Gateway: $(($gws|%{$_.NextHop}) -join ', ')" -ForegroundColor Gray
     }
 
-    # 2. 各接口 DHCP 与 IP 快照
-    $activeIps = Get-NetIPInterface -AddressFamily IPv4 -OperationalStatus Up -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -notmatch "Loopback|Bluetooth" }
-    $snap.InterfaceCount = $activeIps.Count
-
-    foreach ($ifc in $activeIps) {
-        $addr = Get-NetIPAddress -InterfaceIndex $ifc.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
-        $addrStr = if ($addr) { $addr.IPAddress } else { "空" }
-
-        if ($ifc.Dhcp -ne "Enabled") {
-            $problems += @{
-                Code       = "sdhcp_disable"
-                Severity   = "warning"
-                Message    = "接口 '$($ifc.InterfaceAlias)' DHCP 已停用 (固定地址: $addrStr)"
-                Treatments = @("repair_renew_dhcp")
-            }
-            Write-Host "    [WARN] $($ifc.InterfaceAlias)  DHCP=关闭  IP=$addrStr" -ForegroundColor Yellow
+    foreach ($if in $ifaces) {
+        $ip = Get-NetIPAddress -InterfaceIndex $if.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+        $ipStr = if ($ip) { $ip.IPAddress } else { "none" }
+        if ($if.Dhcp -ne "Enabled") {
+            $issues += @{ Code = "sdhcp_disable"; Severity = "warning"; Message = "Static IPv4 configuration on $($if.InterfaceAlias) (IP: $ipStr)"; Repairs = @() }
+            Write-Host "    [WARN] $($if.InterfaceAlias) DHCP=OFF IP=$ipStr" -ForegroundColor Yellow
         } else {
-            Write-Host "    [OK] $($ifc.InterfaceAlias)  DHCP=开启  IP=$addrStr" -ForegroundColor Green
+            Write-Host "    [OK] $($if.InterfaceAlias) DHCP=ON IP=$ipStr" -ForegroundColor Green
         }
     }
 
-    # 3. APIPA(169.254.x.x) 地址检测
-    $allIpAddrs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceAlias -notmatch "Loopback|Bluetooth" }
-    foreach ($entry in $allIpAddrs) {
-        if ($entry.IPAddress -match "^169\.254\.") {
-            $problems += @{
-                Code       = "nnc_apipa_address"
-                Severity   = "error"
-                Message    = "接口 '$($entry.InterfaceAlias)' 分配了 APIPA 地址 ($($entry.IPAddress))，DHCP 获取失败"
-                Treatments = @("repair_renew_dhcp")
-            }
-            Write-Host "    [FAIL] $($entry.InterfaceAlias)  APIPA=$($entry.IPAddress)" -ForegroundColor Red
+    $allIPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $activeIndexes -contains $_.InterfaceIndex }
+    foreach ($ip in $allIPs) {
+        if ($ip.IPAddress -match "^169\.254\.") {
+            $issues += @{Code="nnc_apipa";Severity="error";Message="APIPA address on $($ip.InterfaceAlias) ($($ip.IPAddress))";Repairs=@("repair_renew_dhcp")}
+            Write-Host "    [FAIL] $($ip.InterfaceAlias) APIPA $($ip.IPAddress)" -ForegroundColor Red
         }
     }
-
-    $hasCritical = ($problems | Where-Object { $_.Severity -eq "error" }).Count -gt 0
-    return @{
-        Healthy  = -not $hasCritical
-        Problems = $problems
-        Raw      = $snap
-        Brief    = if ($hasCritical) { "IP 配置异常" } else { "IP 配置正常" }
-    }
+    $any = ($issues|Where-Object{$_.Severity-eq"error"}).Count -gt 0
+    return @{Passed=-not$any;Issues=$issues;Raw=$d;Summary=if($any){"Network config issues"}else{"Network config OK"}}
 }

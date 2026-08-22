@@ -1,31 +1,20 @@
 function Invoke-RepairEnableAdapter {
-    <#
-    .SYNOPSIS
-        启用处于禁用状态的网络适配器
-    #>
     param([switch]$Quiet)
-
-    if (-not $Quiet) { Write-Host "  [修复] 正在查找被停用的网卡..." -ForegroundColor Yellow }
-
-    $inactiveNics = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-        $_.Status -eq "Disabled" -and $_.Name -notmatch "Bluetooth|Loopback"
+    if (-not $Quiet) { Write-Host "  [Repair] Enabling disabled adapters..." -ForegroundColor Yellow }
+    $disabled = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
+        $_.HardwareInterface -eq $true -and $_.Status -eq "Disabled" -and $_.Name -notmatch "Bluetooth|Loopback"
     }
-
-    if (-not $inactiveNics) {
-        if (-not $Quiet) { Write-Host "    → 所有网卡均处于可用状态" -ForegroundColor Green }
-        return @{ success = $true; message = "没有需要激活的网卡"; changes = @() }
-    }
-
-    $applied = @()
-    foreach ($nic in $inactiveNics) {
+    if (-not $disabled) { if (-not $Quiet) { Write-Host "    Nothing to enable" -ForegroundColor Green }; return @{success=$true;message="No disabled adapters";changes=@()} }
+    $changes = @()
+    $errors = @()
+    foreach ($a in $disabled) {
         try {
-            Enable-NetAdapter -Name $nic.Name -Confirm:$false -ErrorAction SilentlyContinue
-            $applied += "已激活网卡: $($nic.Name)"
-            if (-not $Quiet) { Write-Host "    → 已激活: $($nic.Name)" -ForegroundColor Green }
-        } catch {
-            if (-not $Quiet) { Write-Host "    → 激活失败: $($nic.Name) - $_" -ForegroundColor Red }
+            Enable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop
+            $changes += "Enabled: $($a.Name)"
         }
+        catch { $errors += "$($a.Name): $($_.Exception.Message)" }
     }
-
-    return @{ success = $applied.Count -gt 0; message = "已激活 $($applied.Count) 个网卡"; changes = $applied }
+    $message = "Enabled $($changes.Count) adapter(s)"
+    if ($errors.Count -gt 0) { $message += "; failed $($errors.Count)" }
+    return @{success=$errors.Count-eq0;message=$message;changes=$changes;errors=$errors}
 }

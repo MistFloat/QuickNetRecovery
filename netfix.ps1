@@ -1,520 +1,474 @@
 <#
 .SYNOPSIS
-    QuickNet —— Windows 端网络故障自愈工具
-.DESCRIPTION
-    按层次递进排查网络异常，同时提供人工分步修正与无人值守全自动修正两种执行方式。
-    特有机制：识别到 Meta Tunnel 虚拟适配器时自动执行移除操作。
-.PARAMETER RunAs
-    覆盖配置文件预设的执行策略。接受 "auto"（无人值守自动修复）或 "interactive"（人工确认交互模式）两个值。
-    常用于系统计划任务等无人工介入的场景。
+    NetQuickFix - Windows network diagnostics and repair.
 #>
 
+[CmdletBinding()]
 param(
-    [ValidateSet("auto", "interactive")]
-    [string]$RunAs
+    [ValidateSet("interactive", "auto", "diagnostics")]
+    [string]$RunAs,
+
+    [switch]$NoPause
 )
 
-# ============================================================
-# 环境准备
-# ============================================================
-$script:BasePath       = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:SettingsFile   = Join-Path $script:BasePath "netfix.config.json"
-$script:CheckScriptDir = Join-Path $script:BasePath "diagnostics"
-$script:FixScriptDir   = Join-Path $script:BasePath "repairs"
-$script:ProblemList    = @()
-$script:ActivityLog    = @()
+$script:MyDir          = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:ConfigPath     = Join-Path $script:MyDir "netfix.config.json"
+$script:DiagDir        = Join-Path $script:MyDir "diagnostics"
+$script:RepairDir      = Join-Path $script:MyDir "repairs"
+$script:AllIssues      = @()
+$script:CurrentLogPath = $null
+$script:TranscriptOpen = $false
 
-# ============================================================
-# 基础辅助
-# ============================================================
-function Append-Trace {
-    param([string]$Text)
-    $stamp = Get-Date -Format "HH:mm:ss.fff"
-    $script:ActivityLog += "[$stamp] $Text"
-}
-
-function Show-TitleScreen {
+function Write-Banner {
     Clear-Host
-    Write-Host "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓" -ForegroundColor Cyan
-    Write-Host "┃      QuickNet  系统网络故障自检修复      ┃" -ForegroundColor Cyan
-    Write-Host "┃    分层诊断  ·  智能匹配  ·  一键恢复    ┃" -ForegroundColor Cyan
-    Write-Host "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛" -ForegroundColor Cyan
+    Write-Host "===========================================" -ForegroundColor Cyan
+    Write-Host "      NetQuickFix - Network Quick Fix" -ForegroundColor Cyan
+    Write-Host "===========================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
-function Print-Block {
-    param([string]$Label)
-    Write-Host ""
-    Write-Host "▸ $Label" -ForegroundColor White
+function Write-Section {
+    param([string]$Title)
+    Write-Host "`n--- $Title ---" -ForegroundColor White
 }
 
-# ============================================================
-# 加载用户配置
-# ============================================================
-function Import-UserSettings {
-    if (-not (Test-Path $script:SettingsFile)) {
-        Write-Host "[设置] 配置文件缺失，回退至内置默认值" -ForegroundColor Yellow
-        return @{
-            run_mode      = "interactive"
-            check_targets = @("baidu.com", "sina.com", "bilibili.com")
-            repair_order  = @(
-                "repair_remove_meta_tunnel", "repair_enable_adapter",
-                "repair_renew_dhcp", "repair_reset_winsock",
-                "repair_clear_proxy", "repair_reset_dns",
-                "repair_restart_services", "repair_fix_hosts"
-            )
-            log_enabled   = $true
-        }
+function New-DefaultConfig {
+    return [pscustomobject][ordered]@{
+        run_mode      = "interactive"
+        check_targets = @("baidu.com", "sina.com", "bilibili.com")
+        repair_order  = @(
+            "repair_remove_meta_tunnel",
+            "repair_enable_adapter",
+            "repair_renew_dhcp",
+            "repair_reset_winsock",
+            "repair_clear_proxy",
+            "repair_reset_dns",
+            "repair_restart_services",
+            "repair_fix_hosts"
+        )
+        log_enabled   = $true
+    }
+}
+
+function Read-Config {
+    $config = New-DefaultConfig
+    if (-not (Test-Path -LiteralPath $script:ConfigPath)) {
+        Write-Host "[Config] File not found, using defaults" -ForegroundColor Yellow
+        return $config
     }
 
     try {
-        $cfg = Get-Content $script:SettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        Write-Host "[设置] 已成功解析配置文件" -ForegroundColor DarkGray
-        Write-Host "       当前策略: $($cfg.run_mode)" -ForegroundColor DarkGray
-        return $cfg
-    } catch {
-        Write-Host "[设置] JSON 解析出错: $_" -ForegroundColor Red
-        exit 1
+        $loaded = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     }
+    catch {
+        Write-Host "[Config] Invalid JSON, using defaults: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $config
+    }
+
+    if ($loaded.run_mode -in @("interactive", "auto", "diagnostics")) {
+        $config.run_mode = [string]$loaded.run_mode
+    }
+
+    $targets = @($loaded.check_targets | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) })
+    if ($targets.Count -gt 0) {
+        $config.check_targets = $targets
+    }
+
+    $repairs = @($loaded.repair_order | Where-Object { $_ -is [string] -and $_ -match '^repair_[a-z0-9_]+$' })
+    if ($repairs.Count -gt 0) {
+        $config.repair_order = $repairs
+    }
+
+    if ($loaded.PSObject.Properties.Name -contains "log_enabled") {
+        $config.log_enabled = [bool]$loaded.log_enabled
+    }
+
+    return $config
 }
 
-# ============================================================
-# 提权检测
-# ============================================================
-function Assert-Administrator {
-    $whoAmI = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $role   = New-Object Security.Principal.WindowsPrincipal($whoAmI)
-    $elevated = $role.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function Ensure-Admin {
+    param(
+        [string]$RunMode,
+        [switch]$SkipPause
+    )
 
-    if (-not $elevated) {
-        Write-Host "[权限] 当前未以管理员身份运行，正在请求提升..." -ForegroundColor Yellow
-        $launchInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $launchInfo.FileName = "powershell.exe"
-        $launchInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$($script:BasePath)\netfix.ps1`""
-        $launchInfo.Verb = "RunAs"
-        try {
-            [System.Diagnostics.Process]::Start($launchInfo) | Out-Null
-        } catch {
-            Write-Host "[权限] 提权请求失败: $_" -ForegroundColor Red
-            Write-Host "建议右键脚本选择「以管理员身份运行」" -ForegroundColor Red
-            pause
-        }
-        exit
-    }
-    Write-Host "[权限] 当前已具备管理员身份" -ForegroundColor Green
-}
-
-# ============================================================
-# 动态加载子模块
-# ============================================================
-function Import-SubModules {
-    $checkFiles = Get-ChildItem -Path $script:CheckScriptDir -Filter "*.ps1" -ErrorAction SilentlyContinue
-    foreach ($item in $checkFiles) {
-        try {
-            . $item.FullName
-            Write-Host "[模块] 检测组件: $($item.Name)" -ForegroundColor DarkGray
-        } catch {
-            Write-Host "[模块] 加载检测组件异常: $($item.Name) - $_" -ForegroundColor Red
-            exit 1
-        }
-    }
-
-    $fixFiles = Get-ChildItem -Path $script:FixScriptDir -Filter "*.ps1" -ErrorAction SilentlyContinue
-    foreach ($item in $fixFiles) {
-        try {
-            . $item.FullName
-            Write-Host "[模块] 修复组件: $($item.Name)" -ForegroundColor DarkGray
-        } catch {
-            Write-Host "[模块] 加载修复组件异常: $($item.Name) - $_" -ForegroundColor Red
-            exit 1
-        }
-    }
-}
-
-# ============================================================
-# 分层式全面检查
-# ============================================================
-function Execute-AllChecks {
-    $snapshot = @{}
-
-    Print-Block "健康检查阶段"
-    Write-Host ""
-
-    # 第 0 层：互联网连通性（最快，如通过则直接结束）
-    $snapshot.reachability = Test-InternetReachability
-    $script:ProblemList += $snapshot.reachability.Problems
-    Write-Host "  状况: $($snapshot.reachability.Brief)" -ForegroundColor $(if ($snapshot.reachability.Healthy) { "Green" } else { "Red" })
-
-    if ($snapshot.reachability.Healthy) {
-        Write-Host ""
-        Write-Host "  当前网络可达，后续检查跳过。" -ForegroundColor Green
-        return $snapshot
-    }
-
-    # 第 1 层：适配器/硬件
-    Write-Host ""
-    $snapshot.adapter = Inspect-NetAdapterHealth
-    $script:ProblemList += $snapshot.adapter.Problems
-    Write-Host "  状况: $($snapshot.adapter.Brief)" -ForegroundColor $(if ($snapshot.adapter.Healthy) { "Green" } else { "Red" })
-
-    # 第 2 层：IP/网关/DHCP
-    Write-Host ""
-    $snapshot.ipstack = Audit-IPConfiguration
-    $script:ProblemList += $snapshot.ipstack.Problems
-    Write-Host "  状况: $($snapshot.ipstack.Brief)" -ForegroundColor $(if ($snapshot.ipstack.Healthy) { "Green" } else { "Red" })
-
-    # 第 3 层：域名解析
-    Write-Host ""
-    $snapshot.namespace = Verify-DnsResolution
-    $script:ProblemList += $snapshot.namespace.Problems
-    Write-Host "  状况: $($snapshot.namespace.Brief)" -ForegroundColor $(if ($snapshot.namespace.Healthy) { "Green" } else { "Red" })
-
-    # 第 4 层：操作系统级环境
-    Write-Host ""
-    $snapshot.environment = Scan-SystemSettings
-    $script:ProblemList += $snapshot.environment.Problems
-    Write-Host "  状况: $($snapshot.environment.Brief)" -ForegroundColor $(if ($snapshot.environment.Healthy) { "Green" } else { "Red" })
-
-    return $snapshot
-}
-
-# ============================================================
-# 输出检查报告
-# ============================================================
-function Present-CheckReport {
-    param($Snapshot)
-
-    Print-Block "检查结论"
-    Write-Host ""
-
-    if ($script:ProblemList.Count -eq 0) {
-        Write-Host "  ✓ 系统网络各项指标正常" -ForegroundColor Green
+    if ($env:SKIP_ADMIN_CHECK -eq "1") {
+        Write-Host "[Admin] SKIPPED (test mode)" -ForegroundColor DarkGray
         return
     }
 
-    Write-Host "  本次检测共定位 $($script:ProblemList.Count) 项潜在异常：" -ForegroundColor Yellow
-    Write-Host ""
-
-    $criticalItems = $script:ProblemList | Where-Object { $_.Severity -eq "error" }
-    $minimumItems  = $script:ProblemList | Where-Object { $_.Severity -eq "warning" }
-
-    $counter = 0
-    foreach ($item in ($criticalItems + $minimumItems)) {
-        $counter++
-        $color = if ($item.Severity -eq "error") { "Red" } else { "Yellow" }
-        $tag   = if ($item.Severity -eq "error") { "严重" } else { "提醒" }
-
-        Write-Host ("  [{0,2}] [{1}] {2}" -f $counter, $tag, $item.Message) -ForegroundColor $color
-
-        if ($item.Treatments.Count -gt 0) {
-            $treatNames = $item.Treatments | ForEach-Object {
-                $_.Replace("repair_", "").Replace("_", " ")
-            }
-            Write-Host ("       推荐操作: {0}" -f ($treatNames -join ", ")) -ForegroundColor DarkGray
-        }
-        Write-Host ""
-    }
-}
-
-# ============================================================
-# 按名称触发修复
-# ============================================================
-function Format-FixLabel {
-    param([string]$FixCode)
-    return $FixCode -replace "^repair_", "" -replace "_", " "
-}
-
-function Trigger-SingleFix {
-    param([string]$FixCode, [switch]$Silent)
-
-    $scriptFile = Join-Path $script:FixScriptDir "$FixCode.ps1"
-    if (-not (Test-Path $scriptFile)) {
-        Write-Host "  [略过] 找不到对应修复脚本: $FixCode" -ForegroundColor DarkGray
-        return $null
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host "[Admin] OK" -ForegroundColor Green
+        return
     }
 
-    $fn = "Invoke-$($FixCode -replace '(?:^|-|\.)(.)',{ $args[0].Groups[1].Value.ToUpper() })"
+    Write-Host "[Admin] Requesting elevation..." -ForegroundColor Yellow
+    $scriptPath = Join-Path $script:MyDir "netfix.ps1"
+    $arguments = "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -RunAs $RunMode"
+    if ($SkipPause) {
+        $arguments += " -NoPause"
+    }
+
     try {
-        $outcome = & $fn -Quiet:$Silent
-        Append-Trace "执行修复 $FixCode : $($outcome.message)"
-        return $outcome
-    } catch {
-        Write-Host "  [异常] 修复动作执行出错: $_" -ForegroundColor Red
-        Append-Trace "修复 $FixCode 异常: $_"
-        return @{ success = $false; message = "运行异常: $_"; changes = @() }
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $processInfo.Arguments = $arguments
+        $processInfo.Verb = "RunAs"
+        [System.Diagnostics.Process]::Start($processInfo) | Out-Null
+        exit 0
+    }
+    catch {
+        throw "Administrator permission was not granted. $($_.Exception.Message)"
     }
 }
 
-# ============================================================
-# 人工交互式流程
-# ============================================================
-function Launch-GuidedFlow {
-    param($Snapshot, $Settings)
+function Start-RunLog {
+    param($Config)
 
-    Present-CheckReport -Snapshot $Snapshot
+    if (-not $Config.log_enabled) {
+        return
+    }
 
-    if ($script:ProblemList.Count -eq 0) {
-        Write-Host "按任意键结束..." -ForegroundColor Gray
+    try {
+        $logDir = Join-Path $script:MyDir "logs"
+        if (-not (Test-Path -LiteralPath $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+        }
+        $script:CurrentLogPath = Join-Path $logDir ("netfix-{0}-{1}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss-fff"), $PID)
+        Start-Transcript -LiteralPath $script:CurrentLogPath -Force -ErrorAction Stop | Out-Null
+        $script:TranscriptOpen = $true
+        Write-Host "[Log] $script:CurrentLogPath" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "[Log] Could not start logging: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+function Stop-RunLog {
+    if ($script:TranscriptOpen) {
+        try { Stop-Transcript -ErrorAction Stop | Out-Null } catch {}
+        $script:TranscriptOpen = $false
+    }
+}
+
+function Get-NetQuickFixModuleFiles {
+    $moduleFiles = @()
+    foreach ($directory in @($script:DiagDir, $script:RepairDir)) {
+        if (-not (Test-Path -LiteralPath $directory)) {
+            throw "Required module directory is missing: $directory"
+        }
+
+        $moduleFiles += @(Get-ChildItem -LiteralPath $directory -Filter "*.ps1" -File | Sort-Object Name)
+    }
+    return $moduleFiles
+}
+
+function Run-Diagnostics {
+    param($Config)
+
+    $script:AllIssues = @()
+    $results = @{}
+    $targets = @($Config.check_targets)
+    Write-Section "Diagnosing"
+
+    $results.connectivity = Invoke-DiagConnectivity -Targets $targets
+    $script:AllIssues += @($results.connectivity.Issues)
+    Write-Host "  => $($results.connectivity.Summary)" -ForegroundColor $(if ($results.connectivity.Passed) { "Green" } else { "Red" })
+
+    if ($results.connectivity.Passed) {
+        Write-Host "`n  Internet connectivity is available." -ForegroundColor Green
+        return $results
+    }
+
+    $results.hardware = Invoke-DiagHardware
+    $script:AllIssues += @($results.hardware.Issues)
+    Write-Host "  => $($results.hardware.Summary)" -ForegroundColor $(if ($results.hardware.Passed) { "Green" } else { "Red" })
+
+    $results.network = Invoke-DiagNetwork
+    $script:AllIssues += @($results.network.Issues)
+    Write-Host "  => $($results.network.Summary)" -ForegroundColor $(if ($results.network.Passed) { "Green" } else { "Red" })
+
+    $results.dns = Invoke-DiagDns -Targets $targets
+    $script:AllIssues += @($results.dns.Issues)
+    Write-Host "  => $($results.dns.Summary)" -ForegroundColor $(if ($results.dns.Passed) { "Green" } else { "Red" })
+
+    $results.env = Invoke-DiagEnv
+    $script:AllIssues += @($results.env.Issues)
+    Write-Host "  => $($results.env.Summary)" -ForegroundColor $(if ($results.env.Passed) { "Green" } else { "Red" })
+
+    return $results
+}
+
+function Show-DiagnosticReport {
+    Write-Section "Diagnostic Report"
+    if ($script:AllIssues.Count -eq 0) {
+        Write-Host "  No issues." -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  Found $($script:AllIssues.Count) issue(s):`n" -ForegroundColor Yellow
+    $index = 0
+    foreach ($issue in $script:AllIssues) {
+        $index++
+        $color = if ($issue.Severity -eq "error") { "Red" } else { "Yellow" }
+        $label = if ($issue.Severity -eq "error") { "ERROR" } else { "WARN " }
+        Write-Host ("  [{0,2}] [{1}] {2}" -f $index, $label, $issue.Message) -ForegroundColor $color
+        if (@($issue.Repairs).Count -gt 0) {
+            $names = $issue.Repairs | ForEach-Object { $_.Replace("repair_", "").Replace("_", " ") }
+            Write-Host ("       Fix: {0}" -f ($names -join ", ")) -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Get-RepairDisplayName {
+    param([string]$Name)
+    return ($Name -replace "^repair_", "" -replace "_", " ")
+}
+
+function Get-RecommendedRepairs {
+    param(
+        $Config,
+        [switch]$ErrorsOnly
+    )
+
+    $repairs = @()
+    foreach ($issue in $script:AllIssues) {
+        if ($ErrorsOnly -and $issue.Severity -ne "error") {
+            continue
+        }
+        foreach ($repair in @($issue.Repairs)) {
+            if ($repair -and $repairs -notcontains $repair) {
+                $repairs += $repair
+            }
+        }
+    }
+
+    $ordered = @()
+    foreach ($configuredRepair in @($Config.repair_order)) {
+        if ($repairs -contains $configuredRepair -and $ordered -notcontains $configuredRepair) {
+            $ordered += $configuredRepair
+        }
+    }
+    foreach ($repair in $repairs) {
+        if ($ordered -notcontains $repair) {
+            $ordered += $repair
+        }
+    }
+    return $ordered
+}
+
+function Invoke-RepairByCode {
+    param(
+        [string]$RepairName,
+        [switch]$Quiet
+    )
+
+    $path = Join-Path $script:RepairDir "$RepairName.ps1"
+    if (-not (Test-Path -LiteralPath $path)) {
+        return @{ success = $false; message = "Repair module is missing: $RepairName"; changes = @() }
+    }
+
+    $parts = $RepairName.Split("_")
+    $functionName = "Invoke-"
+    foreach ($part in $parts) {
+        if ($part.Length -gt 0) {
+            $functionName += $part.Substring(0, 1).ToUpper() + $part.Substring(1)
+        }
+    }
+
+    if (-not (Get-Command -Name $functionName -CommandType Function -ErrorAction SilentlyContinue)) {
+        return @{ success = $false; message = "Repair function is missing: $functionName"; changes = @() }
+    }
+
+    try {
+        return & $functionName -Quiet:$Quiet
+    }
+    catch {
+        return @{ success = $false; message = "Exception: $($_.Exception.Message)"; changes = @() }
+    }
+}
+
+function Wait-ForExitKey {
+    param([switch]$Skip)
+
+    if ($Skip -or [Console]::IsInputRedirected) {
+        return
+    }
+
+    Write-Host "`nPress any key to close..." -ForegroundColor Gray
+    try {
         $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
-        return
     }
-
-    # 汇总全部推荐修复项
-    $candidateFixes = @()
-    foreach ($p in $script:ProblemList) {
-        foreach ($r in $p.Treatments) {
-            if ($r -and $candidateFixes -notcontains $r) {
-                $candidateFixes += $r
-            }
-        }
+    catch {
+        $null = Read-Host
     }
-
-    # 按预设优先级排序
-    $prioritized = @()
-    foreach ($entry in $Settings.repair_order) {
-        if ($candidateFixes -contains $entry) {
-            $prioritized += $entry
-        }
-    }
-    foreach ($leftover in $candidateFixes) {
-        if ($prioritized -notcontains $leftover) {
-            $prioritized += $leftover
-        }
-    }
-
-    Print-Block "请选择修复项"
-    Write-Host ""
-    Write-Host "  根据诊断结果，建议依次执行以下修复：" -ForegroundColor Cyan
-
-    for ($n = 0; $n -lt $prioritized.Count; $n++) {
-        $label = Format-FixLabel -FixCode $prioritized[$n]
-        Write-Host ("  [{0}] {1}" -f ($n + 1), $label) -ForegroundColor White
-    }
-    Write-Host "  [A] 快速修复（一次性执行上述全部操作）" -ForegroundColor Green
-    Write-Host "  [0] 不执行任何修复，直接退出" -ForegroundColor Gray
-    Write-Host ""
-
-    $input = Read-Host "请输入你的选择（可多选用逗号分隔，如 1,3,5）"
-
-    if ($input -eq "0" -or $input -eq "") {
-        Write-Host "已取消，本次不做任何修复。" -ForegroundColor Gray
-        return
-    }
-
-    $toExecute = @()
-    if ($input -eq "A" -or $input -eq "a") {
-        $toExecute = $prioritized
-        Write-Host "  已选择：全部修复" -ForegroundColor Green
-    } else {
-        $nums = $input -split "," | ForEach-Object { $_.Trim() -as [int] }
-        foreach ($num in $nums) {
-            if ($num -ge 1 -and $num -le $prioritized.Count) {
-                $toExecute += $prioritized[$num - 1]
-            }
-        }
-    }
-
-    if ($toExecute.Count -eq 0) {
-        Write-Host "未选中任何有效修复项。" -ForegroundColor Yellow
-        return
-    }
-
-    Print-Block "正在执行修复"
-    Write-Host ""
-    $fixOutcomes = @()
-
-    foreach ($fix in $toExecute) {
-        $label = Format-FixLabel -FixCode $fix
-        Write-Host ("  [{0}]" -f $label) -ForegroundColor Yellow
-
-        $outcome = Trigger-SingleFix -FixCode $fix
-        $fixOutcomes += @{ FixCode = $fix; Outcome = $outcome }
-
-        if ($outcome -and $outcome.success) {
-            Write-Host "    ✓ $($outcome.message)" -ForegroundColor Green
-        } elseif ($outcome) {
-            Write-Host "    ✗ $($outcome.message)" -ForegroundColor Red
-        }
-
-        Start-Sleep -Milliseconds 300
-    }
-
-    # 修复完成后二次确认
-    Print-Block "修复结果确认"
-    Write-Host ""
-    Write-Host "  重新验证互联网连通状况..." -ForegroundColor Cyan
-    $recheck = Test-InternetReachability -TimeoutMs 3000
-
-    if ($recheck.Healthy) {
-        Write-Host ""
-        Write-Host "  █████ 网络已恢复正常！█████" -ForegroundColor Green
-    } else {
-        Write-Host ""
-        Write-Host "  ⚠ 当前仍未恢复正常连通，可尝试重启计算机或检查物理链路" -ForegroundColor Yellow
-    }
-
-    Write-Host ""
-    Write-Host "按任意键结束..." -ForegroundColor Gray
-    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
-# ============================================================
-# 无人值守自动修复
-# ============================================================
-function Launch-AutoFlow {
-    param($Snapshot, $Settings)
+function Mode-Interactive {
+    param(
+        $Results,
+        $Config,
+        [switch]$SkipPause
+    )
 
-    if ($Snapshot.reachability.Healthy) {
-        Write-Host ""
-        Write-Host "  █████ 互联网通路正常，不执行修复 █████" -ForegroundColor Green
+    Show-DiagnosticReport
+    if ($script:AllIssues.Count -eq 0) {
+        Wait-ForExitKey -Skip:$SkipPause
         return
     }
 
-    # 汇总推荐修复
-    $candidateFixes = @()
-    foreach ($p in $script:ProblemList) {
-        foreach ($r in $p.Treatments) {
-            if ($r -and $candidateFixes -notcontains $r) {
-                $candidateFixes += $r
+    $ordered = @(Get-RecommendedRepairs -Config $Config)
+    if ($ordered.Count -eq 0) {
+        Write-Host "`n  No safe automatic repair matches this result." -ForegroundColor Yellow
+        Wait-ForExitKey -Skip:$SkipPause
+        return
+    }
+
+    Write-Section "Select Repair"
+    for ($index = 0; $index -lt $ordered.Count; $index++) {
+        Write-Host ("  [{0}] {1}" -f ($index + 1), (Get-RepairDisplayName $ordered[$index])) -ForegroundColor White
+    }
+    Write-Host "  [A] All" -ForegroundColor Green
+    Write-Host "  [0] Exit" -ForegroundColor Gray
+    $choice = Read-Host "Choose (e.g. 1,2,3 or A)"
+
+    if ($choice -eq "0" -or [string]::IsNullOrWhiteSpace($choice)) {
+        return
+    }
+
+    $selected = @()
+    if ($choice -eq "A") {
+        $selected = $ordered
+    }
+    else {
+        foreach ($selectedIndex in ($choice -split "," | ForEach-Object { $_.Trim() -as [int] })) {
+            if ($selectedIndex -ge 1 -and $selectedIndex -le $ordered.Count) {
+                $repair = $ordered[$selectedIndex - 1]
+                if ($selected -notcontains $repair) {
+                    $selected += $repair
+                }
             }
         }
     }
 
-    if ($candidateFixes.Count -eq 0) {
-        Write-Host ""
-        Write-Host "  ⚠ 未匹配到可用的修复策略" -ForegroundColor Yellow
+    if ($selected.Count -eq 0) {
+        Write-Host "  No valid repair was selected." -ForegroundColor Yellow
+        Wait-ForExitKey -Skip:$SkipPause
         return
     }
 
-    # 按优先级排列
-    $prioritized = @()
-    foreach ($entry in $Settings.repair_order) {
-        if ($candidateFixes -contains $entry) {
-            $prioritized += $entry
+    Write-Section "Applying Repairs"
+    foreach ($repair in $selected) {
+        Write-Host ("  [{0}]" -f (Get-RepairDisplayName $repair)) -ForegroundColor Yellow
+        $result = Invoke-RepairByCode $repair
+        if ($result.success) {
+            Write-Host "    OK: $($result.message)" -ForegroundColor Green
         }
-    }
-    foreach ($leftover in $candidateFixes) {
-        if ($prioritized -notcontains $leftover) {
-            $prioritized += $leftover
+        else {
+            Write-Host "    FAIL: $($result.message)" -ForegroundColor Red
+            foreach ($detail in @($result.errors)) {
+                Write-Host "      $detail" -ForegroundColor DarkYellow
+            }
         }
-    }
-
-    Print-Block "全自动修复中"
-    Write-Host ""
-    Write-Host "  即将依次执行 $($prioritized.Count) 个修复动作..." -ForegroundColor Cyan
-    Write-Host ""
-
-    $okCount = 0
-    $ngCount = 0
-    foreach ($fix in $prioritized) {
-        $label = Format-FixLabel -FixCode $fix
-        Write-Host ("  [{0}]" -f $label) -ForegroundColor Yellow
-
-        $outcome = Trigger-SingleFix -FixCode $fix -Silent
-
-        if ($outcome -and $outcome.success) {
-            Write-Host "    ✓ $($outcome.message)" -ForegroundColor Green
-            $okCount++
-        } elseif ($outcome) {
-            Write-Host "    ⚠ $($outcome.message)" -ForegroundColor DarkYellow
-            $ngCount++
-        }
-
         Start-Sleep -Milliseconds 200
     }
 
-    # 二次核验
-    Print-Block "修复后核验"
-    Write-Host ""
-    Write-Host "  重新检测网络连通状况..." -ForegroundColor Cyan
-    $recheck = Test-InternetReachability -TimeoutMs 3000
+    Write-Section "Verification"
+    Write-Host "  Testing connectivity..." -ForegroundColor Cyan
+    $verification = Invoke-DiagConnectivity -Targets @($Config.check_targets) -TimeoutMs 3000
+    if ($verification.Passed) {
+        Write-Host "`n  Network recovered!" -ForegroundColor Green
+    }
+    else {
+        Write-Host "`n  Still down. Review the log or restart the system." -ForegroundColor Yellow
+    }
+    Wait-ForExitKey -Skip:$SkipPause
+}
 
-    Write-Host ""
-    if ($recheck.Healthy) {
-        Write-Host "  █████ 互联网已恢复！累计执行 $okCount 项修复 █████" -ForegroundColor Green
-    } else {
-        Write-Host "  ⚠ 网络依旧不通，可尝试重启操作系统" -ForegroundColor Yellow
-        Write-Host "  成功: $okCount | 未成功: $ngCount" -ForegroundColor Gray
+function Mode-Auto {
+    param(
+        $Results,
+        $Config
+    )
+
+    if ($Results.connectivity.Passed) {
+        Write-Host "`n  Network OK; no repairs were applied." -ForegroundColor Green
+        return
+    }
+
+    # Warning-only repairs can represent intentional user configuration, so they
+    # remain available in interactive mode but are ignored in automatic mode.
+    $ordered = @(Get-RecommendedRepairs -Config $Config -ErrorsOnly)
+    if ($ordered.Count -eq 0) {
+        Write-Host "`n  No safe automatic repair matches the detected errors." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Section "Auto Repair"
+    Write-Host "  Applying $($ordered.Count) repair(s)..."
+    $successful = 0
+    foreach ($repair in $ordered) {
+        Write-Host ("  [{0}]" -f (Get-RepairDisplayName $repair)) -ForegroundColor Yellow
+        $result = Invoke-RepairByCode $repair -Quiet
+        if ($result.success) {
+            Write-Host "    OK: $($result.message)" -ForegroundColor Green
+            $successful++
+        }
+        else {
+            Write-Host "    WARN: $($result.message)" -ForegroundColor DarkYellow
+            foreach ($detail in @($result.errors)) {
+                Write-Host "      $detail" -ForegroundColor DarkYellow
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    }
+
+    Write-Section "Verification"
+    $verification = Invoke-DiagConnectivity -Targets @($Config.check_targets) -TimeoutMs 3000
+    if ($verification.Passed) {
+        Write-Host "`n  Network recovered! ($successful repair(s) succeeded)" -ForegroundColor Green
+    }
+    else {
+        Write-Host "`n  Still down. Review the log or restart the system." -ForegroundColor Yellow
     }
 }
 
-# ============================================================
-# 持久化活动记录
-# ============================================================
-function Dump-ActivityLog {
-    param([string]$Policy)
-    if (-not (Import-UserSettings).log_enabled) { return }
-
-    $logFolder = Join-Path $script:BasePath "logs"
-    if (-not (Test-Path $logFolder)) {
-        New-Item -ItemType Directory -Path $logFolder -Force | Out-Null
+function Main {
+    Write-Banner
+    $config = Read-Config
+    if (-not [string]::IsNullOrWhiteSpace($RunAs)) {
+        $config.run_mode = $RunAs
     }
+    Write-Host "[Config] mode=$($config.run_mode); targets=$($config.check_targets -join ', ')" -ForegroundColor Gray
 
-    $logName = Join-Path $logFolder "quicknet_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
-    $content = @"
-===== QuickNet 运行记录 =====
-时间戳: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-执行策略: $Policy
-异常项数量: $($script:ProblemList.Count)
-
-$(($script:ProblemList | ForEach-Object { "[$($_.Severity)] $($_.Message)" }) -join "`n")
-
-$(($script:ActivityLog) -join "`n")
-"@
-
+    Ensure-Admin -RunMode $config.run_mode -SkipPause:$NoPause
+    Start-RunLog -Config $config
     try {
-        $content | Out-File -FilePath $logName -Encoding UTF8
-    } catch { }
-}
-
-# ============================================================
-# 统一入口
-# ============================================================
-function Entry {
-    param([string]$RunAs)
-
-    Show-TitleScreen
-
-    # 1. 用户配置
-    $settings = Import-UserSettings
-
-    # 命令行的 RunAs 参数会覆盖配置文件
-    if ($RunAs) {
-        $settings.run_mode = $RunAs
-    }
-
-    # 2. 确认管理员身份
-    Assert-Administrator
-
-    # 3. 载入所有诊断 / 修复子脚本
-    Write-Host ""
-    Print-Block "载入子模块"
-    Import-SubModules
-
-    # 4. 逐层诊断
-    Write-Host ""
-    $snapshot = Execute-AllChecks
-
-    # 5. 按策略执行
-    Write-Host ""
-    switch ($settings.run_mode) {
-        "auto" {
-            Launch-AutoFlow -Snapshot $snapshot -Settings $settings
-            break
+        # Dot-source in Main's scope so the imported functions remain visible to
+        # the diagnostic and repair functions called below.
+        foreach ($moduleFile in @(Get-NetQuickFixModuleFiles)) {
+            . $moduleFile.FullName
+            Write-Host "[Load] $($moduleFile.Name)" -ForegroundColor DarkGray
         }
-        "interactive" {
-            Launch-GuidedFlow -Snapshot $snapshot -Settings $settings
-            break
-        }
-        default {
-            Write-Host "未识别的运行策略: $($settings.run_mode)" -ForegroundColor Red
-            Write-Host "请在 netfix.config.json 中把 run_mode 填为 'interactive' 或 'auto'" -ForegroundColor Yellow
+        $results = Run-Diagnostics -Config $config
+        switch ($config.run_mode) {
+            "auto"        { Mode-Auto -Results $results -Config $config }
+            "diagnostics" { Show-DiagnosticReport; Wait-ForExitKey -Skip:$NoPause }
+            "interactive" { Mode-Interactive -Results $results -Config $config -SkipPause:$NoPause }
         }
     }
-
-    # 6. 落盘日志
-    Dump-ActivityLog -Policy $settings.run_mode
+    catch {
+        Write-Host "`n[Fatal] $($_.Exception.Message)" -ForegroundColor Red
+        Wait-ForExitKey -Skip:$NoPause
+        throw
+    }
+    finally {
+        Stop-RunLog
+    }
 }
 
-# 启动
-Entry -RunAs $RunAs
+if ($MyInvocation.InvocationName -ne ".") {
+    Main
+}

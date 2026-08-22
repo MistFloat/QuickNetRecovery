@@ -1,83 +1,65 @@
-function Test-InternetReachability {
-    <#
-    .SYNOPSIS
-        第 0 层 —— 互联网可达性探测
-    .DESCRIPTION
-        依次对 baidu.com / sina.com / bilibili.com 进行域名解析与端口连通测试，
-        任意一个站点可达即判定网络正常。
-    #>
+function Invoke-DiagConnectivity {
     param(
         [string[]]$Targets = @("baidu.com", "sina.com", "bilibili.com"),
+        [ValidateRange(250, 30000)]
         [int]$TimeoutMs = 2000
     )
 
-    $records = @()
-    $globalHealthy = $false
-
-    Write-Host "  [连通探测] 目标列表: $($Targets -join ', ')" -ForegroundColor Cyan
-
-    foreach ($hostname in $Targets) {
-        $dnsResult = $false
-        $portOpen = $false
-
+    Write-Host "  [Connectivity] Targets: $($Targets -join ', ')" -ForegroundColor Cyan
+    $results = @()
+    $anyOk = $false
+    foreach ($target in $Targets) {
+        $dnsOk = $false
+        $reachable = $false
         try {
-            $addrList = [System.Net.Dns]::GetHostAddresses($hostname)
-            $dnsResult = $addrList.Count -gt 0
-        } catch {
-            $dnsResult = $false
+            $addresses = [System.Net.Dns]::GetHostAddresses($target)
+            $dnsOk = $addresses.Count -gt 0
         }
+        catch {}
 
-        if ($dnsResult) {
+        if ($dnsOk) {
+            $client = $null
+            $waitHandle = $null
             try {
-                $socket = New-Object System.Net.Sockets.TcpClient
-                $connOp = $socket.BeginConnect($hostname, 443, $null, $null)
-                $timedOut = $connOp.AsyncWaitHandle.WaitOne($TimeoutMs, $false)
-                if ($timedOut -and $socket.Connected) {
-                    $socket.EndConnect($connOp)
-                    $portOpen = $true
-                    $globalHealthy = $true
+                $client = New-Object System.Net.Sockets.TcpClient
+                $asyncResult = $client.BeginConnect($target, 443, $null, $null)
+                $waitHandle = $asyncResult.AsyncWaitHandle
+                if ($waitHandle.WaitOne($TimeoutMs, $false) -and $client.Connected) {
+                    $client.EndConnect($asyncResult)
+                    $reachable = $true
+                    $anyOk = $true
                 }
-                $socket.Close()
-            } catch {
-                $portOpen = $false
+            }
+            catch {}
+            finally {
+                if ($waitHandle) { $waitHandle.Close() }
+                if ($client) { $client.Close() }
             }
         }
 
-        $mark  = if ($portOpen) { "[OK]" } else { "[FAIL]" }
-        $color = if ($portOpen) { "Green" } else { "Red" }
-        Write-Host "    $mark $hostname  DNS:$dnsResult  Port:$portOpen" -ForegroundColor $color
-
-        $records += @{
-            Target      = $hostname
-            DnsResolved = $dnsResult
-            Connected   = $portOpen
-        }
+        $status = if ($reachable) { "[OK]" } else { "[FAIL]" }
+        $color = if ($reachable) { "Green" } else { "Red" }
+        Write-Host "    $status $target DNS:$dnsOk TCP:$reachable" -ForegroundColor $color
+        $results += @{ Target = $target; DnsResolved = $dnsOk; Reachable = $reachable }
     }
 
-    $problems = @()
-    if (-not $globalHealthy) {
-        $problems += @{
-            Code       = "conn_all_fail"
-            Severity   = "error"
-            Message    = "所有探测目标均不可达 ($($Targets -join ', '))"
-            Treatments = @("repair_remove_meta_tunnel","repair_enable_adapter","repair_renew_dhcp","repair_reset_winsock","repair_clear_proxy","repair_reset_dns","repair_restart_services","repair_fix_hosts")
-        }
-    } else {
-        $downTargets = $records | Where-Object { -not $_.Connected }
-        foreach ($dt in $downTargets) {
-            $problems += @{
-                Code       = "conn_$($dt.Target.Replace('.','_'))_fail"
-                Severity   = "warning"
-                Message    = "$($dt.Target) 端口不可达"
-                Treatments = @("repair_reset_dns","repair_clear_proxy")
-            }
+    $issues = @()
+    if (-not $anyOk) {
+        # Generic failure alone is not enough evidence for a destructive repair.
+        # The deeper diagnostic layers attach cause-specific recommendations.
+        $issues += @{ Code = "conn_all_fail"; Severity = "error"; Message = "All targets unreachable"; Repairs = @() }
+    }
+    else {
+        foreach ($failedTarget in ($results | Where-Object { -not $_.Reachable })) {
+            $safeCode = $failedTarget.Target.Replace('.', '_')
+            $issues += @{ Code = "conn_${safeCode}_fail"; Severity = "warning"; Message = "Cannot reach $($failedTarget.Target)"; Repairs = @() }
         }
     }
 
     return @{
-        Healthy  = $globalHealthy
-        Problems = $problems
-        Raw      = $records
-        Brief    = if ($globalHealthy) { "互联网连通正常" } else { "全部检测站点不通" }
+        Passed  = $anyOk
+        Issues  = $issues
+        Raw     = $results
+        Summary = if ($anyOk) { "Connectivity OK" } else { "All targets unreachable" }
     }
 }

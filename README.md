@@ -5,19 +5,22 @@
 ## 核心能力
 
 - **层次化诊断**：从外网可达性到操作系统环境，共 5 层递进定位根因
-- **自动配对修复**：根据检查结果自动推荐对应的修复动作，支持一键执行全部修复
-- **双模式运行**：人工分步确认（交互式）与无人值守自动修复两种策略
-- **虚拟网卡专项**：自动识别并移除 Meta Tunnel / TUN / TAP 类干扰适配器
+- **自动配对修复**：根据检查结果推荐对应的修复动作，支持一键执行全部已推荐项
+- **三种运行模式**：交互式修复、无人值守安全修复、仅诊断不修复
+- **虚拟网卡专项**：精确识别 Meta Tunnel 适配器，并在交互模式中由用户确认后处理
 - **安全保护措施**：hosts 修改前自动创建备份，修复后二次连通性验证
-- **运行日志**：完整记录排查与修复全过程，方便回溯
+- **运行日志**：完整记录排查与修复全过程到 `logs/`，方便回溯
+- **桌面快捷方式**：双击桌面的“网络快速修复”即可启动，并自动申请管理员权限
 
 ## 目录与模块
 
 ```
-QuickNet/
+NetQuickFix/
 ├── netfix.ps1                     # 主调度脚本
 ├── netfix.config.json             # 用户自定义配置
 ├── install_task.ps1               # 事件驱动计划任务安装/卸载
+├── install_shortcut.ps1           # 桌面快捷方式创建/移除
+├── logs/                           # 运行日志（首次运行时自动创建）
 ├── diagnostics/                   # 5 层诊断组件
 │   ├── diag_connectivity.ps1      # 第 0 层: Internet 连通性探测
 │   ├── diag_hardware.ps1          # 第 1 层: 适配器/硬件状态
@@ -62,7 +65,21 @@ git clone https://github.com/your-username/NetQuickFix.git
 cd NetQuickFix
 ```
 
-2. **启动脚本**
+2. **推荐：从桌面启动**
+
+首次执行以下命令创建桌面快捷方式：
+
+```powershell
+.\install_shortcut.ps1
+```
+
+以后双击桌面的 **网络快速修复** 即可。快捷方式始终指向当前项目文件，不会生成额外代码副本。需要移除时执行：
+
+```powershell
+.\install_shortcut.ps1 -Remove
+```
+
+3. **直接启动脚本**
 
 右键 `netfix.ps1` → **使用 PowerShell 运行**，或在管理员终端内：
 
@@ -71,7 +88,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\netfix.ps1
 ```
 
-3. **选择执行策略**
+4. **选择执行策略**
 
 默认以交互模式启动。也可通过命令行参数直接指定：
 
@@ -81,6 +98,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 # 交互模式（默认）
 .\netfix.ps1 -RunAs interactive
+
+# 仅诊断，不执行任何修复
+.\netfix.ps1 -RunAs diagnostics
 ```
 
 或者修改 `netfix.config.json` 中的默认模式：
@@ -106,7 +126,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 任务属性：
 
 - **名称**: `NetworkDisconnectRunScript`
-- **触发源**: `Microsoft-Windows-NetworkProfile/Operational` 通道中 `NetworkProfile` 事件 ID 10001（表示网络断开）
+- **触发源**: `Microsoft-Windows-NetworkProfile/Operational` 通道中 `Microsoft-Windows-NetworkProfile` 事件 ID 10001（表示网络断开）
 - **运行身份**: `SYSTEM`，拥有最高权限
 
 ### 交互式操作流程
@@ -119,8 +139,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ### 自动模式操作流程
 
 1. 完整运行全部诊断
-2. 自动执行所有匹配到的修复动作
+2. 只执行“错误”级别问题匹配到的修复动作
 3. 打印修复结果和连通性验证
+
+代理、hosts、静态 IP、Meta Tunnel 等可能属于用户主动配置的项目只会给出警告，不会在无人值守模式中擅自修改。
 
 ## 配置项说明
 
@@ -128,7 +150,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 | 参数              | 类型     | 含义                                                     |
 | ----------------- | -------- | -------------------------------------------------------- |
-| `run_mode`      | string   | 执行策略：`"interactive"`（交互）或 `"auto"`（自动） |
+| `run_mode`      | string   | 执行策略：`"interactive"`（交互）、`"auto"`（自动）或 `"diagnostics"`（仅诊断） |
 | `check_targets` | string[] | 连通探测时的目标站点                                     |
 | `repair_order`  | string[] | 修复动作的执行优先级                                     |
 | `log_enabled`   | bool     | 是否启用日志输出到文件                                   |
@@ -138,6 +160,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - 修复操作会修改操作系统级别的网络设置，请先了解每个修复步骤的具体含义再执行
 - `repair_reset_winsock` 和 `repair_reset_dns` 这两项执行后建议重启系统以确保完全生效
 - hosts 文件修复将自动保留备份，备份件存放于 `C:\Windows\System32\drivers\etc\` 目录下
+- `-RunAs` 命令行参数优先于 `netfix.config.json` 中的 `run_mode`
 
 ## 许可证
 
