@@ -1,6 +1,12 @@
 {
     "run_mode": "interactive",
     "check_targets": ["baidu.com", "sina.com", "bilibili.com"],
+    "proxy_timeout_ms": 4000,
+    "remove_meta_on_proxy_failure": true,
+    "meta_adapter_patterns": [
+        "(?i)Meta.*(?:Tunnel|Channel)",
+        "(?i)(?:Tunnel|Channel).*Meta"
+    ],
     "repair_order": [
         "repair_remove_meta_tunnel",
         "repair_enable_adapter",

@@ -1,41 +1,80 @@
-function Invoke-RepairRemoveMetaTunnel {
-    param([switch]$Quiet)
-    $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match "(?i)Meta.*Tunnel" -or $_.InterfaceDescription -match "(?i)Meta.*Tunnel"
+function Test-NetQuickFixRepairMetaName {
+    param(
+        [string]$Name,
+        [string[]]$Patterns
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    foreach ($pattern in $Patterns) {
+        try { if ($Name -match $pattern) { return $true } } catch {}
     }
-    if (-not $adapters) { if (-not $Quiet) { Write-Host "  [Repair] No Meta Tunnel adapters found" -ForegroundColor Green }; return @{success=$true;message="Nothing to remove";changes=@()} }
+    return $false
+}
+
+function Invoke-RepairRemoveMetaTunnel {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "High")]
+    param(
+        [switch]$Quiet,
+        [string[]]$Patterns = @(
+            "(?i)Meta.*(?:Tunnel|Channel)",
+            "(?i)(?:Tunnel|Channel).*Meta"
+        )
+    )
+
+    $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {
+        (Test-NetQuickFixRepairMetaName -Name $_.Name -Patterns $Patterns) -or
+        (Test-NetQuickFixRepairMetaName -Name $_.InterfaceDescription -Patterns $Patterns)
+    })
+    $pnpDevices = @(Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | Where-Object {
+        Test-NetQuickFixRepairMetaName -Name $_.FriendlyName -Patterns $Patterns
+    })
+
+    foreach ($adapter in $adapters) {
+        if ($adapter.PnPDeviceID -and $pnpDevices.InstanceId -notcontains $adapter.PnPDeviceID) {
+            $pnpDevices += [pscustomobject]@{
+                FriendlyName = $adapter.InterfaceDescription
+                InstanceId = $adapter.PnPDeviceID
+                Status = $adapter.Status
+            }
+        }
+    }
+
+    $pnpDevices = @($pnpDevices | Where-Object { $_.InstanceId } | Sort-Object InstanceId -Unique)
+    if ($pnpDevices.Count -eq 0) {
+        if (-not $Quiet) { Write-Host "  [Repair] No Meta Tunnel/Channel device found" -ForegroundColor Green }
+        return @{ success = $true; message = "No Meta Tunnel/Channel device found"; changes = @(); errors = @() }
+    }
+
     $changes = @()
     $errors = @()
-    foreach ($a in $adapters) {
-        if (-not $Quiet) { Write-Host "  [Repair] Processing: $($a.Name)" -ForegroundColor Yellow }
-        try {
-            Disable-NetAdapter -Name $a.Name -Confirm:$false -ErrorAction Stop
-            $changes += "Disabled: $($a.Name)"
+    foreach ($device in $pnpDevices) {
+        $adapter = $adapters | Where-Object { $_.PnPDeviceID -eq $device.InstanceId } | Select-Object -First 1
+        $displayName = if ($device.FriendlyName) { $device.FriendlyName } else { $device.InstanceId }
+        if (-not $PSCmdlet.ShouldProcess("$displayName [$($device.InstanceId)]", "Remove network device")) {
+            $changes += "Would remove: $displayName [$($device.InstanceId)]"
+            continue
         }
-        catch { $errors += "Disable $($a.Name): $($_.Exception.Message)" }
 
-        try {
-            $pnp = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-                $_.FriendlyName -eq $a.Name -or $_.FriendlyName -eq $a.InterfaceDescription
+        if (-not $Quiet) { Write-Host "  [Repair] Removing: $displayName" -ForegroundColor Yellow }
+        if ($adapter -and $adapter.Status -ne "Disabled") {
+            try {
+                Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction Stop
+                $changes += "Disabled adapter: $($adapter.Name)"
             }
-            if ($pnp -and (Get-Command Remove-PnpDevice -ErrorAction SilentlyContinue)) {
-                $pnp | Remove-PnpDevice -Confirm:$false -ErrorAction Stop
-                $changes += "Removed PnP: $($a.Name)"
-            }
-            else {
-                $wmi = Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $a.Name }
-                if ($wmi) {
-                    Invoke-CimMethod -InputObject $wmi -MethodName Uninstall -ErrorAction Stop | Out-Null
-                    $changes += "Removed WMI: $($a.Name)"
-                }
-            }
+            catch { $errors += "Disable $($adapter.Name): $($_.Exception.Message)" }
         }
-        catch {
-            $errors += "Remove $($a.Name): $($_.Exception.Message)"
-            if (-not $Quiet) { Write-Host "    PnP removal failed: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+
+        $removeOutput = @(& pnputil.exe /remove-device $device.InstanceId 2>&1)
+        if ($LASTEXITCODE -eq 0) {
+            $changes += "Removed device: $displayName [$($device.InstanceId)]"
+        }
+        else {
+            $details = ($removeOutput -join " ").Trim()
+            $errors += "Remove $displayName failed with exit code $LASTEXITCODE. $details"
         }
     }
-    $message = "Processed $($adapters.Count) Meta Tunnel adapter(s)"
+
+    $message = "Processed $($pnpDevices.Count) Meta Tunnel/Channel device(s)"
     if ($errors.Count -gt 0) { $message += "; errors $($errors.Count)" }
-    return @{success=$errors.Count-eq0;message=$message;changes=$changes;errors=$errors}
+    return @{ success = $errors.Count -eq 0; message = $message; changes = $changes; errors = $errors }
 }

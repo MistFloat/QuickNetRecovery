@@ -1,0 +1,4 @@
+# NetQuickFix test fixture
+127.0.0.1 localhost baidu.com # preserve localhost
+0.0.0.0 bilibili.com
+192.0.2.1 example.com

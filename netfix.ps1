@@ -36,6 +36,12 @@ function New-DefaultConfig {
     return [pscustomobject][ordered]@{
         run_mode      = "interactive"
         check_targets = @("baidu.com", "sina.com", "bilibili.com")
+        proxy_timeout_ms = 4000
+        remove_meta_on_proxy_failure = $true
+        meta_adapter_patterns = @(
+            "(?i)Meta.*(?:Tunnel|Channel)",
+            "(?i)(?:Tunnel|Channel).*Meta"
+        )
         repair_order  = @(
             "repair_remove_meta_tunnel",
             "repair_enable_adapter",
@@ -72,6 +78,20 @@ function Read-Config {
     $targets = @($loaded.check_targets | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) })
     if ($targets.Count -gt 0) {
         $config.check_targets = $targets
+    }
+
+    $timeoutValue = 0
+    if ([int]::TryParse([string]$loaded.proxy_timeout_ms, [ref]$timeoutValue) -and $timeoutValue -ge 500 -and $timeoutValue -le 30000) {
+        $config.proxy_timeout_ms = $timeoutValue
+    }
+
+    if ($loaded.PSObject.Properties.Name -contains "remove_meta_on_proxy_failure") {
+        $config.remove_meta_on_proxy_failure = [bool]$loaded.remove_meta_on_proxy_failure
+    }
+
+    $metaPatterns = @($loaded.meta_adapter_patterns | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) })
+    if ($metaPatterns.Count -gt 0) {
+        $config.meta_adapter_patterns = $metaPatterns
     }
 
     $repairs = @($loaded.repair_order | Where-Object { $_ -is [string] -and $_ -match '^repair_[a-z0-9_]+$' })
@@ -177,12 +197,7 @@ function Run-Diagnostics {
     $script:AllIssues += @($results.connectivity.Issues)
     Write-Host "  => $($results.connectivity.Summary)" -ForegroundColor $(if ($results.connectivity.Passed) { "Green" } else { "Red" })
 
-    if ($results.connectivity.Passed) {
-        Write-Host "`n  Internet connectivity is available." -ForegroundColor Green
-        return $results
-    }
-
-    $results.hardware = Invoke-DiagHardware
+    $results.hardware = Invoke-DiagHardware -MetaAdapterPatterns @($Config.meta_adapter_patterns)
     $script:AllIssues += @($results.hardware.Issues)
     Write-Host "  => $($results.hardware.Summary)" -ForegroundColor $(if ($results.hardware.Passed) { "Green" } else { "Red" })
 
@@ -190,13 +205,35 @@ function Run-Diagnostics {
     $script:AllIssues += @($results.network.Issues)
     Write-Host "  => $($results.network.Summary)" -ForegroundColor $(if ($results.network.Passed) { "Green" } else { "Red" })
 
+    $results.dhcp = Invoke-DiagDhcp
+    $script:AllIssues += @($results.dhcp.Issues)
+    Write-Host "  => $($results.dhcp.Summary)" -ForegroundColor $(if ($results.dhcp.Passed) { "Green" } else { "Red" })
+
     $results.dns = Invoke-DiagDns -Targets $targets
     $script:AllIssues += @($results.dns.Issues)
     Write-Host "  => $($results.dns.Summary)" -ForegroundColor $(if ($results.dns.Passed) { "Green" } else { "Red" })
 
-    $results.env = Invoke-DiagEnv
-    $script:AllIssues += @($results.env.Issues)
-    Write-Host "  => $($results.env.Summary)" -ForegroundColor $(if ($results.env.Passed) { "Green" } else { "Red" })
+    $results.hosts = Invoke-DiagHosts -Targets $targets
+    $script:AllIssues += @($results.hosts.Issues)
+    Write-Host "  => $($results.hosts.Summary)" -ForegroundColor $(if ($results.hosts.Passed) { "Green" } else { "Red" })
+
+    $results.lsp = Invoke-DiagLsp
+    $script:AllIssues += @($results.lsp.Issues)
+    Write-Host "  => $($results.lsp.Summary)" -ForegroundColor $(if ($results.lsp.Passed) { "Green" } else { "Red" })
+
+    $metaPresent = $results.hardware.Raw.MetaCount -gt 0
+    $results.proxy = Invoke-DiagProxy `
+        -Targets $targets `
+        -TimeoutMs $Config.proxy_timeout_ms `
+        -DirectConnectivityPassed $results.connectivity.Passed `
+        -MetaAdapterPresent:$metaPresent `
+        -RemoveMetaOnFailure:$Config.remove_meta_on_proxy_failure
+    $script:AllIssues += @($results.proxy.Issues)
+    Write-Host "  => $($results.proxy.Summary)" -ForegroundColor $(if ($results.proxy.Passed) { "Green" } else { "Red" })
+
+    $results.environment = Invoke-DiagEnvironment
+    $script:AllIssues += @($results.environment.Issues)
+    Write-Host "  => $($results.environment.Summary)" -ForegroundColor $(if ($results.environment.Passed) { "Green" } else { "Red" })
 
     return $results
 }
@@ -282,8 +319,17 @@ function Invoke-RepairByCode {
         return @{ success = $false; message = "Repair function is missing: $functionName"; changes = @() }
     }
 
+    $repairParameters = @{ Quiet = [bool]$Quiet }
+    if ($RepairName -eq "repair_remove_meta_tunnel") {
+        $repairParameters.Patterns = @($script:ActiveConfig.meta_adapter_patterns)
+        $repairParameters.Confirm = $false
+    }
+    elseif ($RepairName -eq "repair_fix_hosts") {
+        $repairParameters.Targets = @($script:ActiveConfig.check_targets)
+    }
+
     try {
-        return & $functionName -Quiet:$Quiet
+        return & $functionName @repairParameters
     }
     catch {
         return @{ success = $false; message = "Exception: $($_.Exception.Message)"; changes = @() }
@@ -378,11 +424,12 @@ function Mode-Interactive {
     Write-Section "Verification"
     Write-Host "  Testing connectivity..." -ForegroundColor Cyan
     $verification = Invoke-DiagConnectivity -Targets @($Config.check_targets) -TimeoutMs 3000
-    if ($verification.Passed) {
-        Write-Host "`n  Network recovered!" -ForegroundColor Green
+    $proxyVerification = Invoke-DiagProxy -Targets @($Config.check_targets) -TimeoutMs $Config.proxy_timeout_ms -DirectConnectivityPassed $verification.Passed
+    if ($verification.Passed -and $proxyVerification.Passed) {
+        Write-Host "`n  Network and proxy checks passed." -ForegroundColor Green
     }
     else {
-        Write-Host "`n  Still down. Review the log or restart the system." -ForegroundColor Yellow
+        Write-Host "`n  A connectivity or proxy problem remains. Review the log." -ForegroundColor Yellow
     }
     Wait-ForExitKey -Skip:$SkipPause
 }
@@ -393,16 +440,17 @@ function Mode-Auto {
         $Config
     )
 
-    if ($Results.connectivity.Passed) {
-        Write-Host "`n  Network OK; no repairs were applied." -ForegroundColor Green
-        return
-    }
-
     # Warning-only repairs can represent intentional user configuration, so they
     # remain available in interactive mode but are ignored in automatic mode.
     $ordered = @(Get-RecommendedRepairs -Config $Config -ErrorsOnly)
     if ($ordered.Count -eq 0) {
-        Write-Host "`n  No safe automatic repair matches the detected errors." -ForegroundColor Yellow
+        $errorCount = @($script:AllIssues | Where-Object { $_.Severity -eq "error" }).Count
+        if ($errorCount -eq 0) {
+            Write-Host "`n  No automatic repairs are needed." -ForegroundColor Green
+        }
+        else {
+            Write-Host "`n  No safe automatic repair matches the detected errors." -ForegroundColor Yellow
+        }
         return
     }
 
@@ -427,11 +475,12 @@ function Mode-Auto {
 
     Write-Section "Verification"
     $verification = Invoke-DiagConnectivity -Targets @($Config.check_targets) -TimeoutMs 3000
-    if ($verification.Passed) {
-        Write-Host "`n  Network recovered! ($successful repair(s) succeeded)" -ForegroundColor Green
+    $proxyVerification = Invoke-DiagProxy -Targets @($Config.check_targets) -TimeoutMs $Config.proxy_timeout_ms -DirectConnectivityPassed $verification.Passed
+    if ($verification.Passed -and $proxyVerification.Passed) {
+        Write-Host "`n  Network and proxy checks passed. ($successful repair(s) succeeded)" -ForegroundColor Green
     }
     else {
-        Write-Host "`n  Still down. Review the log or restart the system." -ForegroundColor Yellow
+        Write-Host "`n  A connectivity or proxy problem remains. Review the log." -ForegroundColor Yellow
     }
 }
 
@@ -441,6 +490,7 @@ function Main {
     if (-not [string]::IsNullOrWhiteSpace($RunAs)) {
         $config.run_mode = $RunAs
     }
+    $script:ActiveConfig = $config
     Write-Host "[Config] mode=$($config.run_mode); targets=$($config.check_targets -join ', ')" -ForegroundColor Gray
 
     Ensure-Admin -RunMode $config.run_mode -SkipPause:$NoPause

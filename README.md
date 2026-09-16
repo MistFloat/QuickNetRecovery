@@ -4,10 +4,10 @@
 
 ## 核心能力
 
-- **层次化诊断**：从外网可达性到操作系统环境，共 5 层递进定位根因
+- **完整诊断链**：外网基线之外，逐项执行图片中的硬件、连接、DHCP、DNS、HOSTS、LSP、IE 代理和环境变量检查
 - **自动配对修复**：根据检查结果推荐对应的修复动作，支持一键执行全部已推荐项
 - **三种运行模式**：交互式修复、无人值守安全修复、仅诊断不修复
-- **虚拟网卡专项**：精确识别 Meta Tunnel 适配器，并在交互模式中由用户确认后处理
+- **代理失效联动**：实际测试代理端口和经代理的 HTTPS 访问；确认失效且存在 Meta Tunnel / Meta Channel 时，按配置联动移除设备
 - **安全保护措施**：hosts 修改前自动创建备份，修复后二次连通性验证
 - **运行日志**：完整记录排查与修复全过程到 `logs/`，方便回溯
 - **桌面快捷方式**：双击桌面的“网络快速修复”即可启动，并自动申请管理员权限
@@ -21,12 +21,17 @@ NetQuickFix/
 ├── install_task.ps1               # 事件驱动计划任务安装/卸载
 ├── install_shortcut.ps1           # 桌面快捷方式创建/移除
 ├── logs/                           # 运行日志（首次运行时自动创建）
-├── diagnostics/                   # 5 层诊断组件
-│   ├── diag_connectivity.ps1      # 第 0 层: Internet 连通性探测
-│   ├── diag_hardware.ps1          # 第 1 层: 适配器/硬件状态
-│   ├── diag_network.ps1           # 第 2 层: IP/DHCP/网关配置
-│   ├── diag_dns.ps1               # 第 3 层: DNS 域名解析
-│   └── diag_env.ps1               # 第 4 层: 系统代理/服务/Winsock
+├── diagnostics/                   # 基线连通性 + 8 项专项诊断
+│   ├── diag_connectivity.ps1      # Internet 直连基线
+│   ├── diag_hardware.ps1          # 1. 网卡、链路、设备管理器状态
+│   ├── diag_network.ps1           # 2. IP、路由、网关可达性
+│   ├── diag_dhcp.ps1              # 3. DHCP 服务与租约
+│   ├── diag_dns.ps1               # 4. DNS 服务、服务器与解析
+│   ├── diag_hosts.ps1             # 5. HOSTS 语法、冲突与目标覆盖
+│   ├── diag_lsp.ps1               # 6. Winsock/LSP 目录完整性
+│   ├── diag_proxy.ps1             # 7. IE/PAC/WinHTTP/环境代理实测
+│   └── diag_environment.ps1       # 8. 系统及代理环境变量
+├── tests/                         # 无破坏诊断与联动回归测试
 └── repairs/                       # 8 项修复组件
     ├── repair_remove_meta_tunnel.ps1  # 移除虚拟隧道适配器
     ├── repair_enable_adapter.ps1      # 激活被停用的网卡
@@ -38,15 +43,19 @@ NetQuickFix/
     └── repair_fix_hosts.ps1           # 审查并清理 hosts 异常条目
 ```
 
-### 诊断层次说明
+### 诊断项目说明
 
-| 层次    | 组件             | 检查范围                                          |
-| ------- | ---------------- | ------------------------------------------------- |
-| Layer 0 | 互联网可达性探测 | 对百度 / 新浪 / B 站分别做 DNS + TCP 443 连通测试 |
-| Layer 1 | 适配器/硬件检查  | 网卡启用情况、物理链路信号、虚拟适配器扫描        |
-| Layer 2 | IP 配置审计      | 默认网关存在性及可达性、DHCP 状态、APIPA 地址     |
-| Layer 3 | DNS 解析验证     | DNS 服务器可达性、域名实际解析能力                |
-| Layer 4 | 系统环境排查     | 代理设置、关键服务运行状态、LSP/Winsock、hosts    |
+| 项目 | 检查范围 |
+| ---- | -------- |
+| 连通性基线 | 对配置目标执行 DNS + TCP 443 直连测试；无论结果如何都会继续后续诊断 |
+| 网络硬件配置 | 物理网卡启用状态、媒体链路、设备管理器错误码、Meta 设备识别 |
+| 网络连接配置 | IPv4 地址、APIPA、默认路由、网关 ICMP 可达性、重复本机地址 |
+| DHCP 服务 | DHCP Client 服务状态、启用 DHCP 的活动网卡及有效租约 |
+| DNS 服务 | DNS Client 服务、服务器逐一查询、目标域名系统解析 |
+| HOSTS 文件 | 文件可读性、语法、冲突映射、检测目标是否被本机地址阻断 |
+| LSP 协议 | Winsock Catalog 可读性、核心提供程序、协议链和提供程序 DLL |
+| IE 代理 | IE 固定代理、PAC/自动检测、WinHTTP 和环境代理；测试端口及实际 HTTPS 访问 |
+| 环境变量 | HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY 及关键系统路径 |
 
 ## 使用入门
 
@@ -131,7 +140,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ### 交互式操作流程
 
-1. 启动后自动完成全部 5 层诊断
+1. 启动后自动完成连通性基线和全部 8 项专项诊断
 2. 输出检测摘要，标注所有发现的问题及对应的修复建议
 3. 输入编号选择要执行的修复项（支持逗号分隔多选），或输入 `A` 一键执行全部
 4. 修复完成后自动验证网络是否恢复
@@ -142,7 +151,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 2. 只执行“错误”级别问题匹配到的修复动作
 3. 打印修复结果和连通性验证
 
-代理、hosts、静态 IP、Meta Tunnel 等可能属于用户主动配置的项目只会给出警告，不会在无人值守模式中擅自修改。
+正常工作的代理和正常存在的 Meta 网卡不会被修改。只有代理端点本身不可达，或直连正常但经代理访问全部失败，并且确实找到匹配的 Meta Tunnel / Meta Channel 设备时，才会生成设备移除修复。若直连与代理同时失败，则视为全局断网，不会贸然删除 Meta 设备；该联动也可通过配置关闭。
 
 ## 配置项说明
 
@@ -152,6 +161,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 | ----------------- | -------- | -------------------------------------------------------- |
 | `run_mode`      | string   | 执行策略：`"interactive"`（交互）、`"auto"`（自动）或 `"diagnostics"`（仅诊断） |
 | `check_targets` | string[] | 连通探测时的目标站点                                     |
+| `proxy_timeout_ms` | int | 单次代理端口及 HTTPS 测试超时，允许 500–30000 毫秒 |
+| `remove_meta_on_proxy_failure` | bool | 代理确认失效时是否推荐/自动执行 Meta 设备移除 |
+| `meta_adapter_patterns` | string[] | 用于识别 Meta Tunnel / Meta Channel 名称的正则表达式 |
 | `repair_order`  | string[] | 修复动作的执行优先级                                     |
 | `log_enabled`   | bool     | 是否启用日志输出到文件                                   |
 
@@ -160,6 +172,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - 修复操作会修改操作系统级别的网络设置，请先了解每个修复步骤的具体含义再执行
 - `repair_reset_winsock` 和 `repair_reset_dns` 这两项执行后建议重启系统以确保完全生效
 - hosts 文件修复将自动保留备份，备份件存放于 `C:\Windows\System32\drivers\etc\` 目录下
+- Meta 修复使用设备的 PNP Instance ID 调用 `pnputil /remove-device`，只移除匹配设备，不删除驱动包
 - `-RunAs` 命令行参数优先于 `netfix.config.json` 中的 `run_mode`
 
 ## 许可证
